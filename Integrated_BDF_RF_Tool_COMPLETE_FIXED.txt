@@ -78,6 +78,11 @@ class IntegratedBDFRFTool:
         self.rf_bar_stress_path = tk.StringVar()
         self.rf_combined_stress_path = tk.StringVar()
         self.rf_allowable_path = tk.StringVar()
+
+        # Tab 4 path variables (used in setup_tab4)
+        self.bar_stress_path = tk.StringVar()
+        self.combined_stress_path = tk.StringVar()
+        self.allowable_path = tk.StringVar()
         self.rf_output_folder = tk.StringVar()
         self.rf_min_rf_var = tk.StringVar(value="1.0")
         self.rf_r2_threshold_var = tk.StringVar(value="0.95")
