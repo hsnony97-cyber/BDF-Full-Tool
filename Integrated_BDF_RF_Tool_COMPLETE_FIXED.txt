@@ -88,6 +88,11 @@ class IntegratedBDFRFTool:
         self.rf_r2_threshold_var = tk.StringVar(value="0.95")
         self.rf_min_data_points_var = tk.StringVar(value="3")
 
+        # Tab 4 settings variables (used in setup_tab4)
+        self.min_rf_var = tk.StringVar(value="1.0")
+        self.r2_threshold_var = tk.StringVar(value="0.95")
+        self.min_data_points_var = tk.StringVar(value="3")
+
         self.setup_ui()
     
     def setup_ui(self):
