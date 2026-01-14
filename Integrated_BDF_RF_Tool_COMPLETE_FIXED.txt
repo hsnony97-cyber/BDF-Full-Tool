@@ -2898,7 +2898,7 @@ class IntegratedBDFRFTool:
         log_frame = ttk.LabelFrame(main, text="8. Log", padding="10")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=5, padx=10)
         
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=18, font=('Courier', 9))
+        self.rf_log_text = scrolledtext.ScrolledText(log_frame, height=18, font=('Courier', 9))
         self.rf_log_text.pack(fill=tk.BOTH, expand=True)
     
     def rf_log(self, msg):
