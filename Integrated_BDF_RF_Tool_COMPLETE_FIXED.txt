@@ -1428,15 +1428,30 @@ class IntegratedBDFRFTool:
             xl = pd.ExcelFile(self.property_excel_path.get())
             sheets = xl.sheet_names
             bar_sh = skin_sh = res_sh = None
+
+            # First pass: exact matches (priority)
+            for s in sheets:
+                sl = s.lower().replace('_',' ').replace('-',' ')
+                if sl == 'skin property' or sl == 'skinproperty':
+                    skin_sh = s
+                elif sl == 'bar property' or sl == 'barproperty':
+                    bar_sh = s
+                elif sl == 'residual strength' or sl == 'residualstrength':
+                    res_sh = s
+
+            # Second pass: partial matches
             for s in sheets:
                 sl = s.lower().replace('_',' ')
-                if 'bar' in sl and 'prop' in sl: bar_sh = s
-                elif 'skin' in sl and 'prop' in sl: skin_sh = s
-                elif 'residual' in sl or 'strength' in sl: res_sh = s
-            
+                if not bar_sh and 'bar' in sl and 'prop' in sl:
+                    bar_sh = s
+                elif not skin_sh and 'skin' in sl and 'prop' in sl:
+                    skin_sh = s
+                elif not res_sh and ('residual' in sl or 'strength' in sl):
+                    res_sh = s
+
             self.bar_properties.clear()
             self.skin_properties.clear()
-            
+
             if bar_sh:
                 df = pd.read_excel(xl, sheet_name=bar_sh)
                 for _, row in df.iterrows():
@@ -1446,7 +1461,7 @@ class IntegratedBDFRFTool:
                         d2 = float(row.iloc[2]) if len(df.columns)>2 else 0
                         self.bar_properties[pid] = {'dim1':d1, 'dim2':d2}
                     except: pass
-            
+
             if skin_sh:
                 df = pd.read_excel(xl, sheet_name=skin_sh)
                 for _, row in df.iterrows():
@@ -1455,19 +1470,28 @@ class IntegratedBDFRFTool:
                         t = float(row.iloc[1])
                         self.skin_properties[pid] = {'thickness':t}
                     except: pass
-            
+
             if res_sh:
                 self.residual_strength_df = pd.read_excel(xl, sheet_name=res_sh)
-            
+
             self.bar_prop_text.delete(1.0, tk.END)
             self.bar_prop_text.insert(tk.END, f"Bar: {len(self.bar_properties)} loaded")
             self.skin_prop_text.delete(1.0, tk.END)
             self.skin_prop_text.insert(tk.END, f"Skin: {len(self.skin_properties)} loaded")
             self.resid_text.delete(1.0, tk.END)
             self.resid_text.insert(tk.END, f"Residual: {'Yes' if self.residual_strength_df is not None else 'No'}")
-            
-            messagebox.showinfo("OK", f"Bar:{len(self.bar_properties)} Skin:{len(self.skin_properties)}")
+
+            # Log which sheets were used
+            print(f"[Load Properties] Bar sheet: {bar_sh}, Skin sheet: {skin_sh}")
+            print(f"[Load Properties] Bar PIDs: {len(self.bar_properties)}, Skin PIDs: {len(self.skin_properties)}")
+            if self.skin_properties:
+                sample_pids = list(self.skin_properties.keys())[:5]
+                print(f"[Load Properties] Sample Skin PIDs: {sample_pids}")
+
+            messagebox.showinfo("OK", f"Bar:{len(self.bar_properties)} Skin:{len(self.skin_properties)}\n\nSheets used:\nBar: {bar_sh}\nSkin: {skin_sh}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             messagebox.showerror("Error", str(e))
     
     def read_file(self, path):
@@ -1510,6 +1534,8 @@ class IntegratedBDFRFTool:
         i = 0
         stats = {'pbarl': 0, 'pbar': 0, 'pshell': 0, 'pcomp': 0}
         warnings = []
+        pshell_found = []
+        pcomp_found = []
         
         while i < len(lines):
             line = lines[i]
@@ -1576,6 +1602,7 @@ class IntegratedBDFRFTool:
                         pid = int(float(line.split(',')[1].strip()))
                     else:
                         pid = int(float(line[8:16].strip()))
+                    pshell_found.append(pid)
                     if pid in self.skin_properties:
                         t = self.skin_properties[pid]['thickness']
                         if ',' in line:
@@ -1603,6 +1630,7 @@ class IntegratedBDFRFTool:
                         pid = int(float(line.split(',')[1].strip()))
                     else:
                         pid = int(float(line[8:16].strip()))
+                    pcomp_found.append(pid)
                     ply_count, end_idx = self.count_pcomp_plies(lines, i)
                     if pid in self.skin_properties:
                         if ply_count > 1:
@@ -1649,6 +1677,18 @@ class IntegratedBDFRFTool:
                 new_lines.append(line)
                 i += 1
         
+        # Debug logging
+        print(f"[Update Props] File: {os.path.basename(filepath)}")
+        print(f"[Update Props] PSHELL found in BDF: {len(pshell_found)}, PIDs: {pshell_found[:10]}...")
+        print(f"[Update Props] PCOMP found in BDF: {len(pcomp_found)}, PIDs: {pcomp_found[:10]}...")
+        print(f"[Update Props] Skin properties loaded: {len(self.skin_properties)}")
+        if pshell_found:
+            matched = [p for p in pshell_found if p in self.skin_properties]
+            not_matched = [p for p in pshell_found if p not in self.skin_properties]
+            print(f"[Update Props] PSHELL matched: {len(matched)}, not matched: {len(not_matched)}")
+            if not_matched:
+                print(f"[Update Props] Sample unmatched PSHELL PIDs: {not_matched[:5]}")
+
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write('\n'.join(new_lines))
         return stats, warnings
@@ -1669,6 +1709,11 @@ class IntegratedBDFRFTool:
             self.log2("="*60)
             self.log2("STEP 1: Update Properties")
             self.log2("="*60)
+            self.log2(f"  Loaded Bar properties: {len(self.bar_properties)}")
+            self.log2(f"  Loaded Skin properties: {len(self.skin_properties)}")
+            if self.skin_properties:
+                sample_pids = list(self.skin_properties.keys())[:5]
+                self.log2(f"  Sample Skin PIDs: {sample_pids}")
             out_folder = self.run_output_folder.get()
             os.makedirs(out_folder, exist_ok=True)
             all_warnings = []
@@ -1680,11 +1725,17 @@ class IntegratedBDFRFTool:
                 stats, warnings = self.update_properties_in_file(out_bdf)
                 self.log2(f"    Updated: PBARL={stats['pbarl']} PBAR={stats['pbar']} PSHELL={stats['pshell']} PCOMP={stats['pcomp']}")
                 all_warnings.extend(warnings)
+            if all_warnings:
+                self.log2("\n  Warnings:")
+                for w in all_warnings[:10]:
+                    self.log2(f"    {w}")
             self.log2("\n" + "="*60)
             self.log2("COMPLETED!")
             self.root.after(0, lambda: messagebox.showinfo("Done","Properties updated!"))
         except Exception as e:
             self.log2(f"ERROR: {e}")
+            import traceback
+            self.log2(traceback.format_exc())
             self.root.after(0, lambda: messagebox.showerror("Error",str(e)))
         finally:
             self.root.after(0, lambda: [self.progress2.stop(), self.btn1.config(state=tk.NORMAL)])
