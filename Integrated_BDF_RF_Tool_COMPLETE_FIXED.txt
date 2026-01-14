@@ -2773,8 +2773,8 @@ class IntegratedBDFRFTool:
     # All methods from rf_check_tool_v2_1.txt
     # ========================================================================
     def setup_tab4(self):
-        canvas = tk.Canvas(self.root)
-        scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
+        canvas = tk.Canvas(self.tab4)
+        scrollbar = ttk.Scrollbar(self.tab4, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
         
         scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
