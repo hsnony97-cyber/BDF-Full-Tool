@@ -1089,17 +1089,37 @@ class IntegratedBDFRFTool:
             self.log1("\n[1] Reading Excel...")
             xl = pd.ExcelFile(self.excel_path.get())
             sheets = xl.sheet_names
-            
+            self.log1(f"    Available sheets: {sheets}")
+
             thermal_sh = maneuver_sh = element_sh = None
+
+            # First pass: look for exact or specific matches
             for s in sheets:
                 sl = s.lower()
-                if 'thermal' in sl: thermal_sh = s
-                elif 'maneuver' in sl or 'manevra' in sl: maneuver_sh = s
-                elif 'element' in sl or 'set' in sl: element_sh = s
-            
+                # Element_Set exact match (priority)
+                if sl == 'element_set' or sl == 'elementset':
+                    element_sh = s
+                # Thermal
+                elif 'thermal' in sl and not thermal_sh:
+                    thermal_sh = s
+                # Maneuver
+                elif ('maneuver' in sl or 'manevra' in sl) and not maneuver_sh:
+                    maneuver_sh = s
+
+            # Second pass: if element_sh not found, look for partial matches
+            if not element_sh:
+                for s in sheets:
+                    sl = s.lower()
+                    if 'element' in sl and 'set' in sl:
+                        element_sh = s
+                        break
+
+            # Fallback to index-based if still not found
             if not thermal_sh and len(sheets) > 0: thermal_sh = sheets[0]
             if not maneuver_sh and len(sheets) > 1: maneuver_sh = sheets[1]
             if not element_sh and len(sheets) > 2: element_sh = sheets[2]
+
+            self.log1(f"    Using sheets -> Thermal: '{thermal_sh}', Maneuver: '{maneuver_sh}', Element_Set: '{element_sh}'")
             
             thermal_cases = pd.read_excel(xl, sheet_name=thermal_sh).iloc[:,0].dropna().astype(int).tolist() if thermal_sh else []
             maneuver_cases = pd.read_excel(xl, sheet_name=maneuver_sh).iloc[:,0].dropna().astype(int).tolist() if maneuver_sh else []
