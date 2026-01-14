@@ -1930,25 +1930,25 @@ class IntegratedBDFRFTool:
         threading.Thread(target=self.apply_offsets_tab2, daemon=True).start()
     
     def apply_offsets_tab2(self):
-        """Apply offsets from CSV to all BDF files"""
+        """Apply offsets from CSV to all BDF files - TEXT BASED (preserves INCLUDEs)"""
         try:
             self.log2("\n" + "="*60)
-            self.log2("APPLYING OFFSETS TO BDF FILES")
+            self.log2("APPLYING OFFSETS TO BDF FILES (Text-based)")
             self.log2("="*60)
-            
+
             # Read offset CSV
             self.log2("\nReading offset CSV...")
             landing_offsets = {}  # {eid: zoffset}
             bar_offsets = {}      # {eid: (offset_x, offset_y, offset_z)}
-            
+
             with open(self.tab2_offset_csv.get(), 'r') as f:
                 reader = csv.reader(f)
                 section = None
-                
+
                 for row in reader:
                     if not row or not row[0]:
                         continue
-                    
+
                     if 'LANDING OFFSETS' in row[0]:
                         section = 'landing'
                         next(reader)  # Skip header
@@ -1957,7 +1957,7 @@ class IntegratedBDFRFTool:
                         section = 'bar'
                         next(reader)  # Skip header
                         continue
-                    
+
                     if section == 'landing':
                         try:
                             eid = int(row[0])
@@ -1974,75 +1974,164 @@ class IntegratedBDFRFTool:
                             bar_offsets[eid] = (offset_x, offset_y, offset_z)
                         except:
                             pass
-            
+
             self.log2(f"  Loaded {len(landing_offsets)} landing offsets")
             self.log2(f"  Loaded {len(bar_offsets)} bar offsets")
-            
-            # Apply to each BDF file
+
+            # Helper function to format field (8-char fixed width)
+            def fmt_field(value, width=8):
+                if isinstance(value, float):
+                    s = f"{value:.4f}"
+                    if len(s) > width:
+                        s = f"{value:.2E}"
+                    return s[:width].ljust(width)
+                return str(value)[:width].ljust(width)
+
+            # Apply to each BDF file using text replacement
             total_landing = 0
             total_bar = 0
-            
+
             for bdf_path in self.run_bdfs:
                 self.log2(f"\n  Processing: {os.path.basename(bdf_path)}")
-                
-                # Read BDF
-                bdf = BDF(debug=False)
-                bdf.read_bdf(bdf_path, validate=False, xref=True, 
-                            read_includes=True, encoding='latin-1')
-                
-                # Apply landing offsets
+
+                # Read file as text
+                with open(bdf_path, 'r', encoding='latin-1') as f:
+                    lines = f.readlines()
+
+                new_lines = []
+                i = 0
                 landing_modified = 0
-                for eid, zoffset in landing_offsets.items():
-                    if eid in bdf.elements:
-                        elem = bdf.elements[eid]
-                        elem.zoffset = zoffset
-                        landing_modified += 1
-                
-                # Apply bar offsets
                 bar_modified = 0
-                for eid, offset_vec in bar_offsets.items():
-                    if eid in bdf.elements:
-                        elem = bdf.elements[eid]
-                        if elem.type == 'CBAR':
-                            elem.wa = np.array(offset_vec)
-                            elem.wb = np.array(offset_vec)
-                            bar_modified += 1
-                
+
+                while i < len(lines):
+                    line = lines[i]
+
+                    # Check for CQUAD4 (landing/skin elements with zoffset)
+                    if line.startswith('CQUAD4'):
+                        # Parse element ID from field 2 (chars 8-16)
+                        try:
+                            eid = int(line[8:16].strip())
+                            if eid in landing_offsets:
+                                zoff = landing_offsets[eid]
+                                # CQUAD4 format: CQUAD4, EID, PID, G1, G2, G3, G4, THETA, ZOFFS
+                                # Fields are 8 chars each
+                                # Field 8 (chars 56-64) is THETA/MCID, Field 9 (chars 64-72) is ZOFFS
+                                if len(line) >= 64:
+                                    # Modify ZOFFS field (field 9, chars 64-72)
+                                    new_line = line[:64] + fmt_field(zoff) + line[72:] if len(line) > 72 else line[:64] + fmt_field(zoff) + '\n'
+                                    new_lines.append(new_line)
+                                    landing_modified += 1
+                                    i += 1
+                                    continue
+                        except:
+                            pass
+                        new_lines.append(line)
+                        i += 1
+                        continue
+
+                    # Check for CBAR elements
+                    elif line.startswith('CBAR'):
+                        # Parse element ID from field 2 (chars 8-16)
+                        try:
+                            eid = int(line[8:16].strip())
+                            if eid in bar_offsets:
+                                offset_vec = bar_offsets[eid]
+                                # CBAR can be single line or multi-line (with continuation)
+                                # Format: CBAR, EID, PID, GA, GB, X1, X2, X3, OFFT (line 1)
+                                #         +, PA, PB, W1A, W2A, W3A, W1B, W2B, W3B (line 2)
+
+                                # Check if next line is continuation
+                                if i + 1 < len(lines) and (lines[i+1].startswith('+') or lines[i+1].startswith('*') or lines[i+1].startswith(' ')):
+                                    # Multi-line CBAR - modify continuation line
+                                    cont_line = lines[i+1]
+                                    # Fields on continuation: +, PA, PB, W1A, W2A, W3A, W1B, W2B, W3B
+                                    # W1A at field 4 (chars 24-32), W2A at field 5 (chars 32-40), W3A at field 6 (chars 40-48)
+                                    # W1B at field 7 (chars 48-56), W2B at field 8 (chars 56-64), W3B at field 9 (chars 64-72)
+
+                                    # Keep first part (continuation marker, PA, PB)
+                                    new_cont = cont_line[:24]
+                                    # Add W1A, W2A, W3A
+                                    new_cont += fmt_field(offset_vec[0])
+                                    new_cont += fmt_field(offset_vec[1])
+                                    new_cont += fmt_field(offset_vec[2])
+                                    # Add W1B, W2B, W3B (same as WA)
+                                    new_cont += fmt_field(offset_vec[0])
+                                    new_cont += fmt_field(offset_vec[1])
+                                    new_cont += fmt_field(offset_vec[2])
+                                    new_cont += '\n'
+
+                                    new_lines.append(line)
+                                    new_lines.append(new_cont)
+                                    bar_modified += 1
+                                    i += 2
+                                    continue
+                                else:
+                                    # Single line CBAR - need to add continuation for offsets
+                                    new_lines.append(line.rstrip() + '+CB' + str(eid)[-4:] + '\n')
+                                    # Create continuation line with offsets
+                                    cont_name = '+CB' + str(eid)[-4:]
+                                    new_cont = cont_name.ljust(8)
+                                    new_cont += '        '  # PA (blank)
+                                    new_cont += '        '  # PB (blank)
+                                    new_cont += fmt_field(offset_vec[0])  # W1A
+                                    new_cont += fmt_field(offset_vec[1])  # W2A
+                                    new_cont += fmt_field(offset_vec[2])  # W3A
+                                    new_cont += fmt_field(offset_vec[0])  # W1B
+                                    new_cont += fmt_field(offset_vec[1])  # W2B
+                                    new_cont += fmt_field(offset_vec[2])  # W3B
+                                    new_cont += '\n'
+                                    new_lines.append(new_cont)
+                                    bar_modified += 1
+                                    i += 1
+                                    continue
+                        except:
+                            pass
+                        new_lines.append(line)
+                        i += 1
+                        continue
+
+                    else:
+                        new_lines.append(line)
+                        i += 1
+
                 # Save with "_offset" suffix
                 base_name = os.path.basename(bdf_path)
                 name_parts = os.path.splitext(base_name)
                 output_name = name_parts[0] + "_offset" + name_parts[1]
                 output_path = os.path.join(os.path.dirname(bdf_path), output_name)
-                
-                bdf.write_bdf(output_path, size=8, is_double=False)
-                
-                self.log2(f"    Landing: {landing_modified}, Bar: {bar_modified}")
+
+                with open(output_path, 'w', encoding='latin-1') as f:
+                    f.writelines(new_lines)
+
+                self.log2(f"    Landing (ZOFFS): {landing_modified}, Bar (WA/WB): {bar_modified}")
                 self.log2(f"    Saved: {output_name}")
-                
+
                 total_landing += landing_modified
                 total_bar += bar_modified
-            
+
             self.log2("\n" + "="*60)
             self.log2("OFFSET APPLICATION COMPLETED!")
             self.log2("="*60)
             self.log2(f"\nTotal across all files:")
-            self.log2(f"  Landing elements: {total_landing}")
-            self.log2(f"  Bar elements: {total_bar}")
+            self.log2(f"  Landing elements (ZOFFS): {total_landing}")
+            self.log2(f"  Bar elements (WA/WB): {total_bar}")
             self.log2(f"  Files processed: {len(self.run_bdfs)}")
+            self.log2("  * INCLUDEs preserved (text-based modification)")
             self.log2("="*60)
-            
+
             self.root.after(0, lambda: messagebox.showinfo("Success",
                 f"Offsets applied to {len(self.run_bdfs)} BDF files!\n\n"
-                f"Landing: {total_landing}\nBar: {total_bar}\n\n"
-                f"Files saved with '_offset' suffix"))
-        
+                f"Landing (ZOFFS): {total_landing}\nBar (WA/WB): {total_bar}\n\n"
+                f"Files saved with '_offset' suffix\n"
+                f"INCLUDEs preserved!"))
+
         except Exception as e:
             self.log2(f"\nERROR: {e}")
             import traceback
             self.log2(traceback.format_exc())
             self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
         finally:
-            self.root.after(0, lambda: [self.progress2.stop(), 
+            self.root.after(0, lambda: [self.progress2.stop(),
                                        self.btn_apply_offset_tab2.config(state=tk.NORMAL)])
 
 
@@ -2441,10 +2530,10 @@ class IntegratedBDFRFTool:
         threading.Thread(target=self.apply_offsets, daemon=True).start()
 
     def apply_offsets(self):
-        """Apply offsets from CSV to BDF"""
+        """Apply offsets from CSV to BDF - TEXT BASED (preserves INCLUDEs)"""
         try:
             self.log3("\n" + "="*70)
-            self.log3("STEP 2: APPLYING OFFSETS FROM CSV")
+            self.log3("STEP 2: APPLYING OFFSETS FROM CSV (Text-based)")
             self.log3("="*70)
 
             # Read CSV
@@ -2490,49 +2579,113 @@ class IntegratedBDFRFTool:
             self.log3(f"  Loaded {len(landing_offsets)} landing offsets")
             self.log3(f"  Loaded {len(bar_offsets)} bar offsets")
 
-            # Read BDF with pyNastran
+            # Helper function to format field (8-char fixed width)
+            def fmt_field(value, width=8):
+                if isinstance(value, float):
+                    s = f"{value:.4f}"
+                    if len(s) > width:
+                        s = f"{value:.2E}"
+                    return s[:width].ljust(width)
+                return str(value)[:width].ljust(width)
+
+            # Read BDF as text
             self.log3("\n" + "="*70)
-            self.log3("Reading BDF with pyNastran...")
+            self.log3("Reading BDF as text (preserves INCLUDEs)...")
 
-            bdf = BDF(debug=False)
-            bdf.read_bdf(self.offset_input_bdf.get(), validate=False, xref=True, 
-                        read_includes=True, encoding='latin-1')
+            bdf_path = self.offset_input_bdf.get()
+            with open(bdf_path, 'r', encoding='latin-1') as f:
+                lines = f.readlines()
 
-            self.log3(f"  Nodes: {len(bdf.nodes)}")
-            self.log3(f"  Elements: {len(bdf.elements)}")
+            self.log3(f"  Total lines: {len(lines)}")
 
-            # Apply Landing offsets
-            self.log3("\n[1] Applying Landing Offsets...")
+            # Apply offsets using text replacement
+            new_lines = []
+            i = 0
             landing_modified = 0
-
-            for eid, zoffset in landing_offsets.items():
-                if eid in bdf.elements:
-                    elem = bdf.elements[eid]
-                    elem.zoffset = zoffset
-                    landing_modified += 1
-
-            self.log3(f"  Modified {landing_modified} landing elements")
-
-            # Apply Bar offsets
-            self.log3("\n[2] Applying Bar Offsets...")
             bar_modified = 0
 
-            for eid, offset_vec in bar_offsets.items():
-                if eid in bdf.elements:
-                    elem = bdf.elements[eid]
-                    if elem.type == 'CBAR':
-                        elem.wa = np.array(offset_vec)
-                        elem.wb = np.array(offset_vec)
-                        bar_modified += 1
+            while i < len(lines):
+                line = lines[i]
 
-            self.log3(f"  Modified {bar_modified} bar elements")
+                # Check for CQUAD4 (landing/skin elements with zoffset)
+                if line.startswith('CQUAD4'):
+                    try:
+                        eid = int(line[8:16].strip())
+                        if eid in landing_offsets:
+                            zoff = landing_offsets[eid]
+                            if len(line) >= 64:
+                                new_line = line[:64] + fmt_field(zoff) + line[72:] if len(line) > 72 else line[:64] + fmt_field(zoff) + '\n'
+                                new_lines.append(new_line)
+                                landing_modified += 1
+                                i += 1
+                                continue
+                    except:
+                        pass
+                    new_lines.append(line)
+                    i += 1
+                    continue
+
+                # Check for CBAR elements
+                elif line.startswith('CBAR'):
+                    try:
+                        eid = int(line[8:16].strip())
+                        if eid in bar_offsets:
+                            offset_vec = bar_offsets[eid]
+
+                            # Check if next line is continuation
+                            if i + 1 < len(lines) and (lines[i+1].startswith('+') or lines[i+1].startswith('*') or lines[i+1].startswith(' ')):
+                                cont_line = lines[i+1]
+                                new_cont = cont_line[:24]
+                                new_cont += fmt_field(offset_vec[0])
+                                new_cont += fmt_field(offset_vec[1])
+                                new_cont += fmt_field(offset_vec[2])
+                                new_cont += fmt_field(offset_vec[0])
+                                new_cont += fmt_field(offset_vec[1])
+                                new_cont += fmt_field(offset_vec[2])
+                                new_cont += '\n'
+
+                                new_lines.append(line)
+                                new_lines.append(new_cont)
+                                bar_modified += 1
+                                i += 2
+                                continue
+                            else:
+                                new_lines.append(line.rstrip() + '+CB' + str(eid)[-4:] + '\n')
+                                cont_name = '+CB' + str(eid)[-4:]
+                                new_cont = cont_name.ljust(8)
+                                new_cont += '        '
+                                new_cont += '        '
+                                new_cont += fmt_field(offset_vec[0])
+                                new_cont += fmt_field(offset_vec[1])
+                                new_cont += fmt_field(offset_vec[2])
+                                new_cont += fmt_field(offset_vec[0])
+                                new_cont += fmt_field(offset_vec[1])
+                                new_cont += fmt_field(offset_vec[2])
+                                new_cont += '\n'
+                                new_lines.append(new_cont)
+                                bar_modified += 1
+                                i += 1
+                                continue
+                    except:
+                        pass
+                    new_lines.append(line)
+                    i += 1
+                    continue
+
+                else:
+                    new_lines.append(line)
+                    i += 1
+
+            self.log3(f"\n[1] Landing Offsets (ZOFFS): {landing_modified}")
+            self.log3(f"[2] Bar Offsets (WA/WB): {bar_modified}")
 
             # Write output BDF
             self.log3("\n[3] Writing output BDF...")
-            output_dir = os.path.dirname(self.offset_input_bdf.get())
+            output_dir = os.path.dirname(bdf_path)
             output_path = os.path.join(output_dir, self.offset_output_name.get())
 
-            bdf.write_bdf(output_path, size=8, is_double=False)
+            with open(output_path, 'w', encoding='latin-1') as f:
+                f.writelines(new_lines)
 
             self.log3(f"\nOutput: {output_path}")
             self.log3(f"File size: {os.path.getsize(output_path) / (1024*1024):.2f} MB")
@@ -2541,13 +2694,14 @@ class IntegratedBDFRFTool:
             self.log3("APPLICATION COMPLETED!")
             self.log3("="*70)
             self.log3(f"\nSummary:")
-            self.log3(f"  Landing elements: {landing_modified}")
-            self.log3(f"  Bar elements: {bar_modified}")
+            self.log3(f"  Landing elements (ZOFFS): {landing_modified}")
+            self.log3(f"  Bar elements (WA/WB): {bar_modified}")
             self.log3(f"  Output: {os.path.basename(output_path)}")
+            self.log3("  * INCLUDEs preserved (text-based modification)")
             self.log3("="*70)
 
             self.root.after(0, lambda: messagebox.showinfo("Success",
-                f"Offsets applied!\n\nLanding: {landing_modified}\nBar: {bar_modified}\n\nOutput: {self.offset_output_name.get()}"))
+                f"Offsets applied!\n\nLanding (ZOFFS): {landing_modified}\nBar (WA/WB): {bar_modified}\n\nOutput: {self.offset_output_name.get()}\n\nINCLUDEs preserved!"))
 
         except Exception as e:
             self.log3(f"\nERROR: {e}")
