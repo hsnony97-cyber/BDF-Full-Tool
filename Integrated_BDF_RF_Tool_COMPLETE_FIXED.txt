@@ -71,9 +71,11 @@ class IntegratedBDFRFTool:
         self.rf_combined_stress_df = None
         self.rf_merged_combined_df = None
         self.rf_max_stress_df = None
+        self.rf_max_stress_elem_df = None
         self.rf_allowable_df = None
         self.rf_allowable_interp = {}
         self.rf_results_df = None
+        self.rf_results_elem_df = None
         
         self.rf_bar_stress_path = tk.StringVar()
         self.rf_combined_stress_path = tk.StringVar()
@@ -3217,60 +3219,78 @@ class IntegratedBDFRFTool:
     def rf_merge_and_create_summary(self):
         """
         Merge Property (via Element), then Dim1/Dim2 (via Property).
-        Then create max_stress_summary grouped by Property.
+        Then create max_stress_summary grouped by Property AND Element.
         """
         self.rf_log("\n" + "="*70)
         self.rf_log("MERGE DATA & CREATE MAX STRESS SUMMARY")
         self.rf_log("="*70)
-        
+
         if self.combined_stress_df is None:
             messagebox.showerror("Error", "Load combined_stress file first")
             return
-        
+
         if self.bar_stress_df is None:
             messagebox.showerror("Error", "Load bar_stress file first")
             return
-        
+
+        # Determine output folder
+        out_dir = self.output_folder.get()
+        if not out_dir:
+            # Use bar_stress file directory as default
+            bar_path = self.bar_stress_path.get()
+            if bar_path:
+                out_dir = os.path.dirname(bar_path)
+                self.output_folder.set(out_dir)
+            else:
+                out_dir = filedialog.askdirectory(title="Select Output Folder")
+                if not out_dir:
+                    messagebox.showerror("Error", "Please select an output folder")
+                    return
+                self.output_folder.set(out_dir)
+
+        os.makedirs(out_dir, exist_ok=True)
+        self.rf_log(f"Output folder: {out_dir}")
+
         self.rf_update_progress(10, "Merging data...")
-        
+
         try:
             combined = self.combined_stress_df.copy()
             bar = self.bar_stress_df.copy()
-            
+
             self.rf_log(f"\nCombined stress: {len(combined)} rows, columns: {list(combined.columns)}")
             self.rf_log(f"Bar stress: {len(bar)} rows, columns: {list(bar.columns)}")
-            
+
             # =========================================================
             # STEP 1: Create Element -> Property lookup
             # =========================================================
             self.rf_log("\n--- STEP 1: Element -> Property lookup ---")
-            
+
             elem_to_prop = bar.groupby('Element')['Property'].first().reset_index()
             self.rf_log(f"  Unique Element->Property: {len(elem_to_prop)}")
-            
+
             # =========================================================
             # STEP 2: Create Property -> Dim1, Dim2, Area lookup
             # =========================================================
             self.rf_log("\n--- STEP 2: Property -> Dim1/Dim2 lookup ---")
-            
+
             prop_cols = ['Property']
             for col in ['Dim1', 'Dim2', 'Area']:
                 if col in bar.columns:
                     prop_cols.append(col)
-            
+
             prop_lookup = bar.groupby('Property').first().reset_index()[prop_cols]
             self.rf_log(f"  Unique Property->Dim: {len(prop_lookup)}")
-            
+
             # Sample
             self.rf_log(f"\n  Sample Property lookup:")
             for _, row in prop_lookup.head(3).iterrows():
                 self.rf_log(f"    Property {int(row['Property'])}: Dim1={row.get('Dim1', 'N/A')}, Dim2={row.get('Dim2', 'N/A')}")
-            
+
             # =========================================================
             # STEP 3: Merge Property into combined using Element
             # =========================================================
             self.rf_log("\n--- STEP 3: Merge Property (via Element) ---")
-            
+
             if 'Property' not in combined.columns:
                 merged = combined.merge(elem_to_prop, on='Element', how='left')
                 n_prop = merged['Property'].notna().sum()
@@ -3278,26 +3298,26 @@ class IntegratedBDFRFTool:
             else:
                 merged = combined.copy()
                 self.rf_log(f"  Property already exists")
-            
+
             # =========================================================
             # STEP 4: Merge Dim1, Dim2 using Property
             # =========================================================
             self.rf_log("\n--- STEP 4: Merge Dim1/Dim2 (via Property) ---")
-            
+
             dim_cols = [c for c in prop_cols if c != 'Property' and c not in merged.columns]
-            
+
             if dim_cols:
                 self.rf_log(f"  Adding columns: {dim_cols}")
                 merge_cols = ['Property'] + dim_cols
                 merged = merged.merge(prop_lookup[merge_cols], on='Property', how='left')
-                
+
                 for col in dim_cols:
                     if col in merged.columns:
                         n_filled = merged[col].notna().sum()
                         self.rf_log(f"    {col}: {n_filled}/{len(merged)} filled")
             else:
                 self.rf_log(f"  All Dim columns already exist")
-            
+
             # Verify merge
             self.rf_log(f"\n  Verification (first 3 rows):")
             for _, row in merged.head(3).iterrows():
@@ -3306,63 +3326,98 @@ class IntegratedBDFRFTool:
                 dim1 = row.get('Dim1', 'N/A')
                 dim2 = row.get('Dim2', 'N/A')
                 self.rf_log(f"    Element {elem}: Property={prop}, Dim1={dim1}, Dim2={dim2}")
-            
+
             self.merged_combined_df = merged.copy()
-            
+
             # =========================================================
-            # STEP 5: Create Max Stress Summary by Property
+            # STEP 5A: Create Max Stress Summary by Property
             # =========================================================
-            self.rf_update_progress(50, "Creating max stress summary...")
-            self.rf_log("\n--- STEP 5: Max Stress Summary ---")
-            
+            self.rf_update_progress(50, "Creating max stress summary (Property)...")
+            self.rf_log("\n--- STEP 5A: Max Stress Summary (Property-based) ---")
+
             stress_col = 'Combined_Stress' if 'Combined_Stress' in merged.columns else 'Stress'
             self.rf_log(f"  Stress column: {stress_col}")
-            
+
             # Filter valid Property
             valid_mask = merged['Property'].notna()
             merged_valid = merged[valid_mask].copy()
             self.rf_log(f"  Valid rows: {len(merged_valid)}")
-            
+
             # Absolute stress
             merged_valid['Abs_Stress'] = merged_valid[stress_col].abs()
-            
+
             # Max stress per property
             idx_max = merged_valid.groupby('Property')['Abs_Stress'].idxmax()
             max_rows = merged_valid.loc[idx_max].copy()
             self.rf_log(f"  Unique properties: {len(max_rows)}")
-            
+
             # Min stress per property
             min_stress = merged_valid.groupby('Property')[stress_col].min().reset_index()
             min_stress.columns = ['Property', 'Min_Stress']
-            
+
             max_stress_summary = max_rows.merge(min_stress, on='Property', how='left')
-            
+
             # Rename
             if stress_col in max_stress_summary.columns:
                 max_stress_summary = max_stress_summary.rename(columns={stress_col: 'Max_Stress'})
-            
+
             # Remove temp
             if 'Abs_Stress' in max_stress_summary.columns:
                 max_stress_summary = max_stress_summary.drop(columns=['Abs_Stress'])
-            
+
             # Reorder columns
             priority = ['Property', 'Dim1', 'Dim2', 'Area', 'Max_Stress', 'Min_Stress', 'Element', 'Combined_LC']
             final_cols = [c for c in priority if c in max_stress_summary.columns]
             other_cols = [c for c in max_stress_summary.columns if c not in final_cols]
             max_stress_summary = max_stress_summary[final_cols + other_cols]
-            
+
             self.max_stress_df = max_stress_summary
-            
+
+            # =========================================================
+            # STEP 5B: Create Max Stress Summary by Element
+            # =========================================================
+            self.rf_update_progress(60, "Creating max stress summary (Element)...")
+            self.rf_log("\n--- STEP 5B: Max Stress Summary (Element-based) ---")
+
+            # Max stress per element
+            idx_max_elem = merged_valid.groupby('Element')['Abs_Stress'].idxmax()
+            max_rows_elem = merged_valid.loc[idx_max_elem].copy()
+            self.rf_log(f"  Unique elements: {len(max_rows_elem)}")
+
+            # Min stress per element
+            min_stress_elem = merged_valid.groupby('Element')[stress_col].min().reset_index()
+            min_stress_elem.columns = ['Element', 'Min_Stress']
+
+            max_stress_elem_summary = max_rows_elem.merge(min_stress_elem, on='Element', how='left')
+
+            # Rename
+            if stress_col in max_stress_elem_summary.columns:
+                max_stress_elem_summary = max_stress_elem_summary.rename(columns={stress_col: 'Max_Stress'})
+
+            # Remove temp
+            if 'Abs_Stress' in max_stress_elem_summary.columns:
+                max_stress_elem_summary = max_stress_elem_summary.drop(columns=['Abs_Stress'])
+
+            # Reorder columns
+            priority_elem = ['Element', 'Property', 'Dim1', 'Dim2', 'Area', 'Max_Stress', 'Min_Stress', 'Combined_LC']
+            final_cols_elem = [c for c in priority_elem if c in max_stress_elem_summary.columns]
+            other_cols_elem = [c for c in max_stress_elem_summary.columns if c not in final_cols_elem]
+            max_stress_elem_summary = max_stress_elem_summary[final_cols_elem + other_cols_elem]
+
+            self.max_stress_elem_df = max_stress_elem_summary
+
             # =========================================================
             # STEP 6: Save and Report
             # =========================================================
             self.rf_update_progress(80, "Saving files...")
             self.rf_log("\n--- STEP 6: Results ---")
-            
+
             n_props = len(max_stress_summary)
-            self.rf_log(f"  Max Stress Summary: {n_props} properties")
-            
-            self.rf_log(f"\n  Sample results:")
+            n_elems = len(max_stress_elem_summary)
+            self.rf_log(f"  Max Stress Summary (Property): {n_props} properties")
+            self.rf_log(f"  Max Stress Summary (Element): {n_elems} elements")
+
+            self.rf_log(f"\n  Sample Property results:")
             self.rf_log(f"  {'Property':<12} {'Dim1':>8} {'Dim2':>8} {'Max_Stress':>12}")
             self.rf_log("  " + "-"*50)
             for _, row in max_stress_summary.head(5).iterrows():
@@ -3371,26 +3426,27 @@ class IntegratedBDFRFTool:
                 dim2 = row.get('Dim2', 0)
                 max_s = row.get('Max_Stress', 0)
                 self.rf_log(f"  {prop:<12} {dim1:>8.2f} {dim2:>8.2f} {max_s:>12.4f}")
-            
-            # Save
-            if self.output_folder.get():
-                out_dir = self.output_folder.get()
-                
-                merged_path = os.path.join(out_dir, "merged_combined_stress.csv")
-                self.merged_combined_df.to_csv(merged_path, index=False)
-                self.rf_log(f"\n  Saved: merged_combined_stress.csv ({len(self.merged_combined_df)} rows)")
-                
-                summary_path = os.path.join(out_dir, "max_stress_summary.csv")
-                max_stress_summary.to_csv(summary_path, index=False)
-                self.rf_log(f"  Saved: max_stress_summary.csv ({n_props} rows)")
-            
+
+            # Save files
+            merged_path = os.path.join(out_dir, "merged_combined_stress.csv")
+            self.merged_combined_df.to_csv(merged_path, index=False)
+            self.rf_log(f"\n  Saved: merged_combined_stress.csv ({len(self.merged_combined_df)} rows)")
+
+            summary_path = os.path.join(out_dir, "max_stress_summary.csv")
+            max_stress_summary.to_csv(summary_path, index=False)
+            self.rf_log(f"  Saved: max_stress_summary.csv ({n_props} rows)")
+
+            elem_summary_path = os.path.join(out_dir, "max_stress_element_summary.csv")
+            max_stress_elem_summary.to_csv(elem_summary_path, index=False)
+            self.rf_log(f"  Saved: max_stress_element_summary.csv ({n_elems} rows)")
+
             self.merge_status.config(
-                text=f"✓ Merged: {len(self.merged_combined_df)} rows, Summary: {n_props} properties",
+                text=f"✓ Props: {n_props}, Elems: {n_elems}",
                 foreground="green"
             )
-            
+
             self.rf_update_progress(100, "Done")
-            
+
         except Exception as e:
             self.rf_log(f"\nERROR: {e}")
             import traceback
@@ -3667,31 +3723,35 @@ class IntegratedBDFRFTool:
             return None
     
     def rf_calculate_rf(self):
-        """Calculate Reserve Factor for each property."""
+        """Calculate Reserve Factor for each property and element."""
         self.rf_log("\n" + "="*70)
         self.rf_log("CALCULATING RESERVE FACTORS + REQUIRED THICKNESS")
         self.rf_log("="*70)
-        
+
         if self.max_stress_df is None:
             messagebox.showerror("Error", "Create max stress summary first (Step 2)")
             return
-        
+
         if not self.allowable_interp:
             messagebox.showerror("Error", "Load allowable data first (Step 3)")
             return
-        
+
         try:
             min_rf_target = float(self.min_rf_var.get())
         except:
             min_rf_target = 1.0
-        
+
         self.rf_log(f"Target RF: {min_rf_target}")
-        
-        self.rf_update_progress(10, "Calculating RF...")
-        
+
+        self.rf_update_progress(10, "Calculating RF (Property-based)...")
+
         try:
+            # =========================================================
+            # PART A: Property-based RF calculation
+            # =========================================================
+            self.rf_log("\n--- Property-based RF ---")
             results = []
-            
+
             for idx, row in self.max_stress_df.iterrows():
                 pid = row.get('Property')
                 dim1 = row.get('Dim1', 0)
@@ -3700,34 +3760,34 @@ class IntegratedBDFRFTool:
                 min_stress = row.get('Min_Stress', 0)
                 element = row.get('Element', None)
                 combined_lc = row.get('Combined_LC', None)
-                
+
                 pid_int = int(pid) if pd.notna(pid) else None
-                
+
                 allowable = self.get_allowable_stress(pid_int, dim1) if pid_int else None
-                
+
                 if allowable and max_stress > 0:
                     rf = allowable / max_stress
                 elif max_stress == 0:
                     rf = 999.0
                 else:
                     rf = 0.0
-                
+
                 if allowable is None:
                     status = "NO_ALLOWABLE"
                 elif rf >= min_rf_target:
                     status = "PASS"
                 else:
                     status = "FAIL"
-                
+
                 is_excluded = False
                 if pid_int and pid_int in self.allowable_interp:
                     is_excluded = self.allowable_interp[pid_int].get('excluded', False)
-                
+
                 # Calculate Required Thickness
                 required_thickness = None
                 if pid_int and max_stress > 0:
                     required_thickness = self.get_required_thickness(pid_int, max_stress, min_rf_target)
-                
+
                 results.append({
                     'Property': pid_int,
                     'Dim1': dim1,
@@ -3742,29 +3802,110 @@ class IntegratedBDFRFTool:
                     'Combined_LC': combined_lc,
                     'Allowable_Excluded': is_excluded
                 })
-            
+
             self.rf_results_df = pd.DataFrame(results)
-            
-            # Statistics
+
+            # Statistics for Property-based
             valid = self.rf_results_df[self.rf_results_df['Status'] != 'NO_ALLOWABLE']
-            
+
             n_total = len(self.rf_results_df)
             n_pass = len(self.rf_results_df[self.rf_results_df['Status'] == 'PASS'])
             n_fail = len(self.rf_results_df[self.rf_results_df['Status'] == 'FAIL'])
             n_no_allow = len(self.rf_results_df[self.rf_results_df['Status'] == 'NO_ALLOWABLE'])
-            
+
             min_rf = valid['RF'].min() if len(valid) > 0 else 0
             max_rf = valid['RF'].max() if len(valid) > 0 else 0
             mean_rf = valid['RF'].mean() if len(valid) > 0 else 0
-            
+
+            self.rf_log(f"  Properties: {n_total}, PASS: {n_pass}, FAIL: {n_fail}, NO_ALLOW: {n_no_allow}")
+            self.rf_log(f"  Min RF: {min_rf:.4f}, Max RF: {max_rf:.4f}, Mean RF: {mean_rf:.4f}")
+
+            # =========================================================
+            # PART B: Element-based RF calculation
+            # =========================================================
+            self.rf_update_progress(50, "Calculating RF (Element-based)...")
+            self.rf_log("\n--- Element-based RF ---")
+
+            if hasattr(self, 'max_stress_elem_df') and self.max_stress_elem_df is not None:
+                results_elem = []
+
+                for idx, row in self.max_stress_elem_df.iterrows():
+                    elem = row.get('Element')
+                    pid = row.get('Property')
+                    dim1 = row.get('Dim1', 0)
+                    dim2 = row.get('Dim2', 0)
+                    max_stress = abs(row.get('Max_Stress', 0))
+                    min_stress = row.get('Min_Stress', 0)
+                    combined_lc = row.get('Combined_LC', None)
+
+                    elem_int = int(elem) if pd.notna(elem) else None
+                    pid_int = int(pid) if pd.notna(pid) else None
+
+                    allowable = self.get_allowable_stress(pid_int, dim1) if pid_int else None
+
+                    if allowable and max_stress > 0:
+                        rf = allowable / max_stress
+                    elif max_stress == 0:
+                        rf = 999.0
+                    else:
+                        rf = 0.0
+
+                    if allowable is None:
+                        status = "NO_ALLOWABLE"
+                    elif rf >= min_rf_target:
+                        status = "PASS"
+                    else:
+                        status = "FAIL"
+
+                    is_excluded = False
+                    if pid_int and pid_int in self.allowable_interp:
+                        is_excluded = self.allowable_interp[pid_int].get('excluded', False)
+
+                    # Calculate Required Thickness
+                    required_thickness = None
+                    if pid_int and max_stress > 0:
+                        required_thickness = self.get_required_thickness(pid_int, max_stress, min_rf_target)
+
+                    results_elem.append({
+                        'Element': elem_int,
+                        'Property': pid_int,
+                        'Dim1': dim1,
+                        'Dim2': dim2,
+                        'Max_Stress': max_stress,
+                        'Min_Stress': min_stress,
+                        'Allowable': allowable,
+                        'RF': rf,
+                        'Status': status,
+                        'Required_Thickness': required_thickness,
+                        'Combined_LC': combined_lc,
+                        'Allowable_Excluded': is_excluded
+                    })
+
+                self.rf_results_elem_df = pd.DataFrame(results_elem)
+
+                # Statistics for Element-based
+                valid_elem = self.rf_results_elem_df[self.rf_results_elem_df['Status'] != 'NO_ALLOWABLE']
+
+                n_total_elem = len(self.rf_results_elem_df)
+                n_pass_elem = len(self.rf_results_elem_df[self.rf_results_elem_df['Status'] == 'PASS'])
+                n_fail_elem = len(self.rf_results_elem_df[self.rf_results_elem_df['Status'] == 'FAIL'])
+                n_no_allow_elem = len(self.rf_results_elem_df[self.rf_results_elem_df['Status'] == 'NO_ALLOWABLE'])
+
+                min_rf_elem = valid_elem['RF'].min() if len(valid_elem) > 0 else 0
+
+                self.rf_log(f"  Elements: {n_total_elem}, PASS: {n_pass_elem}, FAIL: {n_fail_elem}, NO_ALLOW: {n_no_allow_elem}")
+                self.rf_log(f"  Min RF: {min_rf_elem:.4f}")
+            else:
+                self.rf_log("  Element-based summary not available (run Merge & Create Summary first)")
+                self.rf_results_elem_df = None
+
+            # =========================================================
+            # Show failing properties with Required Thickness
+            # =========================================================
             self.rf_log(f"\n{'='*50}")
-            self.rf_log(f"Total: {n_total}, PASS: {n_pass}, FAIL: {n_fail}, NO_ALLOW: {n_no_allow}")
-            self.rf_log(f"Min RF: {min_rf:.4f}, Max RF: {max_rf:.4f}, Mean RF: {mean_rf:.4f}")
-            
-            # Show failing with Required Thickness
             failing = self.rf_results_df[self.rf_results_df['Status'] == 'FAIL'].sort_values('RF')
             if len(failing) > 0:
-                self.rf_log(f"\n✗ FAILING ({len(failing)}):")
+                self.rf_log(f"\n✗ FAILING PROPERTIES ({len(failing)}):")
                 self.rf_log(f"{'Property':<12} {'Dim1':>8} {'Stress':>12} {'Allowable':>12} {'RF':>8} {'Req_Thick':>10}")
                 self.rf_log("-"*75)
                 for _, row in failing.head(10).iterrows():
@@ -3772,20 +3913,20 @@ class IntegratedBDFRFTool:
                     req_t_str = f"{req_t:.2f}" if pd.notna(req_t) else "N/A"
                     self.rf_log(f"{row['Property']:<12} {row['Dim1']:>8.2f} {row['Max_Stress']:>12.4f} "
                             f"{row['Allowable']:>12.4f} {row['RF']:>8.4f} {req_t_str:>10}")
-            
+
             # Show Required Thickness summary
             has_req_thick = self.rf_results_df['Required_Thickness'].notna().sum()
             self.rf_log(f"\nRequired Thickness calculated for: {has_req_thick}/{n_total} properties")
-            
+
             # Update summary
             pass_pct = (n_pass / n_total * 100) if n_total > 0 else 0
             self.result_summary.config(
-                text=f"Min RF = {min_rf:.4f} | {n_pass}/{n_total} PASS ({pass_pct:.1f}%) | {n_fail} FAIL",
+                text=f"Min RF = {min_rf:.4f} | Props: {n_pass}/{n_total} PASS ({pass_pct:.1f}%) | {n_fail} FAIL",
                 foreground="green" if n_fail == 0 else "red"
             )
-            
+
             self.rf_update_progress(100, "Done")
-            
+
         except Exception as e:
             self.rf_log(f"\nError: {e}")
             import traceback
@@ -3793,74 +3934,96 @@ class IntegratedBDFRFTool:
             messagebox.showerror("Error", str(e))
     
     def rf_export_results(self):
-        """Export all results."""
+        """Export all results with separate Property and Element sheets."""
         if self.rf_results_df is None:
             messagebox.showerror("Error", "Calculate RF first")
             return
-        
+
         out_dir = self.output_folder.get()
         if not out_dir:
             out_dir = filedialog.askdirectory(title="Select Output Folder")
             if not out_dir:
                 return
             self.output_folder.set(out_dir)
-        
+
         os.makedirs(out_dir, exist_ok=True)
-        
+
         self.rf_log("\n" + "="*70)
         self.rf_log("EXPORTING RESULTS")
         self.rf_log("="*70)
-        
+
         try:
-            # RF Results
-            rf_path = os.path.join(out_dir, "rf_results.csv")
+            # RF Results - Property based
+            rf_path = os.path.join(out_dir, "rf_results_prop.csv")
             self.rf_results_df.to_csv(rf_path, index=False)
-            self.rf_log(f"  ✓ rf_results.csv ({len(self.rf_results_df)} rows)")
-            
-            # Max Stress Summary
+            self.rf_log(f"  ✓ rf_results_prop.csv ({len(self.rf_results_df)} rows)")
+
+            # RF Results - Element based
+            if hasattr(self, 'rf_results_elem_df') and self.rf_results_elem_df is not None:
+                rf_elem_path = os.path.join(out_dir, "rf_results_elem.csv")
+                self.rf_results_elem_df.to_csv(rf_elem_path, index=False)
+                self.rf_log(f"  ✓ rf_results_elem.csv ({len(self.rf_results_elem_df)} rows)")
+
+            # Max Stress Summary - Property based
             if self.max_stress_df is not None:
                 max_path = os.path.join(out_dir, "max_stress_summary.csv")
                 self.max_stress_df.to_csv(max_path, index=False)
                 self.rf_log(f"  ✓ max_stress_summary.csv ({len(self.max_stress_df)} rows)")
-            
+
+            # Max Stress Summary - Element based
+            if hasattr(self, 'max_stress_elem_df') and self.max_stress_elem_df is not None:
+                max_elem_path = os.path.join(out_dir, "max_stress_element_summary.csv")
+                self.max_stress_elem_df.to_csv(max_elem_path, index=False)
+                self.rf_log(f"  ✓ max_stress_element_summary.csv ({len(self.max_stress_elem_df)} rows)")
+
             # Allowable Summary with Required Thickness info
+            allow_data = []
             if self.allowable_interp:
-                allow_data = []
                 for pid, p in self.allowable_interp.items():
                     allow_data.append({
-                        'Property': pid, 
-                        'a': p['a'], 
-                        'b': p['b'], 
-                        'R2': p['r2'], 
-                        'n_pts': p['n_pts'], 
+                        'Property': pid,
+                        'a': p['a'],
+                        'b': p['b'],
+                        'R2': p['r2'],
+                        'n_pts': p['n_pts'],
                         'Excluded': p.get('excluded', False),
                         'Formula': f"Allowable = {p['a']:.4f} × T^({p['b']:.4f})" if not p.get('excluded', False) else f"Allowable = {p['a']:.4f} (constant)"
                     })
                 pd.DataFrame(allow_data).to_csv(os.path.join(out_dir, "allowable_fit_summary.csv"), index=False)
                 self.rf_log(f"  ✓ allowable_fit_summary.csv")
-            
-            # Excel Summary
+
+            # Excel Summary with separate sheets
             try:
                 excel_path = os.path.join(out_dir, "rf_check_summary.xlsx")
                 with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-                    self.rf_results_df.to_excel(writer, sheet_name='RF_Results', index=False)
+                    # RF Results sheets
+                    self.rf_results_df.to_excel(writer, sheet_name='RF_Results_Prop', index=False)
+                    if hasattr(self, 'rf_results_elem_df') and self.rf_results_elem_df is not None:
+                        self.rf_results_elem_df.to_excel(writer, sheet_name='RF_Results_Elem', index=False)
+
+                    # Max Stress sheets
                     if self.max_stress_df is not None:
-                        self.max_stress_df.to_excel(writer, sheet_name='Max_Stress', index=False)
-                    
-                    # Add allowable fit summary
-                    if self.allowable_interp:
+                        self.max_stress_df.to_excel(writer, sheet_name='Max_Stress_Prop', index=False)
+                    if hasattr(self, 'max_stress_elem_df') and self.max_stress_elem_df is not None:
+                        self.max_stress_elem_df.to_excel(writer, sheet_name='Max_Stress_Elem', index=False)
+
+                    # Allowable Fits sheet
+                    if allow_data:
                         allow_df = pd.DataFrame(allow_data)
                         allow_df.to_excel(writer, sheet_name='Allowable_Fits', index=False)
-                
+
                 self.rf_log(f"  ✓ rf_check_summary.xlsx")
-            except:
-                pass
-            
+                self.rf_log(f"    Sheets: RF_Results_Prop, RF_Results_Elem, Max_Stress_Prop, Max_Stress_Elem, Allowable_Fits")
+            except Exception as ex:
+                self.rf_log(f"  Warning: Excel export failed: {ex}")
+
             self.rf_log(f"\nExported to: {out_dir}")
             messagebox.showinfo("Success", f"Results exported to:\n{out_dir}")
-            
+
         except Exception as e:
             self.rf_log(f"\nError: {e}")
+            import traceback
+            self.rf_log(traceback.format_exc())
             messagebox.showerror("Error", str(e))
 
 
