@@ -3976,11 +3976,13 @@ class IntegratedBDFRFTool:
                 self.max_stress_elem_df.to_csv(max_elem_path, index=False)
                 self.rf_log(f"  ✓ max_stress_element_summary.csv ({len(self.max_stress_elem_df)} rows)")
 
-            # Allowable Summary with Required Thickness info
-            allow_data = []
+            # =========================================================
+            # Allowable Summary - Property based (curve fit parameters)
+            # =========================================================
+            allow_prop_data = []
             if self.allowable_interp:
                 for pid, p in self.allowable_interp.items():
-                    allow_data.append({
+                    allow_prop_data.append({
                         'Property': pid,
                         'a': p['a'],
                         'b': p['b'],
@@ -3989,10 +3991,61 @@ class IntegratedBDFRFTool:
                         'Excluded': p.get('excluded', False),
                         'Formula': f"Allowable = {p['a']:.4f} × T^({p['b']:.4f})" if not p.get('excluded', False) else f"Allowable = {p['a']:.4f} (constant)"
                     })
-                pd.DataFrame(allow_data).to_csv(os.path.join(out_dir, "allowable_fit_summary.csv"), index=False)
-                self.rf_log(f"  ✓ allowable_fit_summary.csv")
+                pd.DataFrame(allow_prop_data).to_csv(os.path.join(out_dir, "allowable_fits_props.csv"), index=False)
+                self.rf_log(f"  ✓ allowable_fits_props.csv ({len(allow_prop_data)} properties)")
 
+            # =========================================================
+            # Allowable Summary - Element based (each element's allowable)
+            # =========================================================
+            allow_elem_data = []
+            if self.allowable_interp and hasattr(self, 'max_stress_elem_df') and self.max_stress_elem_df is not None:
+                for _, row in self.max_stress_elem_df.iterrows():
+                    elem = row.get('Element')
+                    pid = row.get('Property')
+                    dim1 = row.get('Dim1', 0)
+
+                    elem_int = int(elem) if pd.notna(elem) else None
+                    pid_int = int(pid) if pd.notna(pid) else None
+
+                    # Calculate allowable for this element using its own Dim1
+                    allowable = None
+                    formula = "N/A"
+                    excluded = False
+                    a_val = b_val = r2_val = None
+
+                    if pid_int and pid_int in self.allowable_interp:
+                        p = self.allowable_interp[pid_int]
+                        a_val = p['a']
+                        b_val = p['b']
+                        r2_val = p['r2']
+                        excluded = p.get('excluded', False)
+
+                        if excluded:
+                            allowable = a_val
+                            formula = f"Allowable = {a_val:.4f} (constant)"
+                        else:
+                            if dim1 > 0:
+                                allowable = a_val * (dim1 ** b_val)
+                                formula = f"{a_val:.4f} × {dim1:.4f}^({b_val:.4f}) = {allowable:.4f}"
+
+                    allow_elem_data.append({
+                        'Element': elem_int,
+                        'Property': pid_int,
+                        'Dim1': dim1,
+                        'a': a_val,
+                        'b': b_val,
+                        'R2': r2_val,
+                        'Excluded': excluded,
+                        'Allowable': allowable,
+                        'Formula': formula
+                    })
+
+                pd.DataFrame(allow_elem_data).to_csv(os.path.join(out_dir, "allowable_fits_elems.csv"), index=False)
+                self.rf_log(f"  ✓ allowable_fits_elems.csv ({len(allow_elem_data)} elements)")
+
+            # =========================================================
             # Excel Summary with separate sheets
+            # =========================================================
             try:
                 excel_path = os.path.join(out_dir, "rf_check_summary.xlsx")
                 with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
@@ -4007,13 +4060,15 @@ class IntegratedBDFRFTool:
                     if hasattr(self, 'max_stress_elem_df') and self.max_stress_elem_df is not None:
                         self.max_stress_elem_df.to_excel(writer, sheet_name='Max_Stress_Elem', index=False)
 
-                    # Allowable Fits sheet
-                    if allow_data:
-                        allow_df = pd.DataFrame(allow_data)
-                        allow_df.to_excel(writer, sheet_name='Allowable_Fits', index=False)
+                    # Allowable Fits sheets
+                    if allow_prop_data:
+                        pd.DataFrame(allow_prop_data).to_excel(writer, sheet_name='Allowable_Fits_Props', index=False)
+                    if allow_elem_data:
+                        pd.DataFrame(allow_elem_data).to_excel(writer, sheet_name='Allowable_Fits_Elems', index=False)
 
                 self.rf_log(f"  ✓ rf_check_summary.xlsx")
-                self.rf_log(f"    Sheets: RF_Results_Prop, RF_Results_Elem, Max_Stress_Prop, Max_Stress_Elem, Allowable_Fits")
+                self.rf_log(f"    Sheets: RF_Results_Prop, RF_Results_Elem, Max_Stress_Prop, Max_Stress_Elem,")
+                self.rf_log(f"            Allowable_Fits_Props, Allowable_Fits_Elems")
             except Exception as ex:
                 self.rf_log(f"  Warning: Excel export failed: {ex}")
 
