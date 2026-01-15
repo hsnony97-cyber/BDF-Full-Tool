@@ -74,6 +74,7 @@ class IntegratedBDFRFTool:
         self.rf_max_stress_elem_df = None
         self.rf_allowable_df = None
         self.rf_allowable_interp = {}
+        self.rf_allowable_elem_interp = {}  # Element-based curve fits
         self.rf_results_df = None
         self.rf_results_elem_df = None
         
@@ -3517,12 +3518,15 @@ class IntegratedBDFRFTool:
                     col_map[col] = 'Allowable'
             
             df = raw_df.rename(columns=col_map)
-            
+
+            # Save full df for element-based fitting (before Property grouping)
+            df_full_elements = df.copy() if 'Element_ID' in df.columns else None
+
             # Check for NEW format
             if 'Element_Type' in df.columns or 'Element_ID' in df.columns:
                 self.rf_log("\nDetected NEW format with Element_Type/Element_ID")
                 df = self._process_new_allowable_format(df)
-            
+
             self.allowable_df = df
             
             self.rf_update_progress(40, "Fitting power law curves...")
@@ -3594,16 +3598,125 @@ class IntegratedBDFRFTool:
             self.rf_log(f"Excluded (data < {min_data_pts}): {len(excluded_data)}")
             
             if valid_props:
-                self.rf_log(f"\nSample valid fits:")
+                self.rf_log(f"\nSample valid fits (Property):")
                 for pid in valid_props[:5]:
                     p = self.allowable_interp[pid]
                     self.rf_log(f"  Property {pid}: Allow = {p['a']:.4f} × T^({p['b']:.4f}), R²={p['r2']:.4f}")
-            
-            self.allowable_status.config(
-                text=f"✓ Loaded: {len(valid_props)} valid, {len(excluded_r2)+len(excluded_data)} excluded",
-                foreground="green"
-            )
-            
+
+            # =========================================================
+            # ELEMENT-BASED CURVE FITTING
+            # =========================================================
+            self.rf_update_progress(70, "Fitting element-based curves...")
+            self.allowable_elem_interp = {}
+
+            if df_full_elements is not None:
+                self.rf_log(f"\n{'='*50}")
+                self.rf_log("ELEMENT-BASED CURVE FITTING")
+                self.rf_log(f"{'='*50}")
+
+                # Convert to numeric
+                df_elem = df_full_elements.copy()
+                df_elem['Thickness'] = pd.to_numeric(df_elem['Thickness'], errors='coerce')
+                df_elem['Allowable'] = pd.to_numeric(df_elem['Allowable'], errors='coerce')
+                df_elem['Element_ID'] = pd.to_numeric(df_elem['Element_ID'], errors='coerce')
+                df_elem['Property'] = pd.to_numeric(df_elem['Property'], errors='coerce')
+                df_elem = df_elem.dropna(subset=['Element_ID', 'Thickness', 'Allowable'])
+
+                elements = df_elem['Element_ID'].unique()
+                self.rf_log(f"Fitting {len(elements)} elements...")
+
+                excluded_elem_r2 = []
+                excluded_elem_data = []
+                valid_elems = []
+
+                for elem_id in elements:
+                    elem_int = int(elem_id)
+                    elem_data = df_elem[df_elem['Element_ID'] == elem_id]
+                    n_pts = len(elem_data)
+
+                    # Get property for this element
+                    elem_pid = elem_data['Property'].iloc[0] if len(elem_data) > 0 else None
+                    elem_pid_int = int(elem_pid) if pd.notna(elem_pid) else None
+
+                    if n_pts < min_data_pts:
+                        avg = elem_data['Allowable'].mean()
+                        self.allowable_elem_interp[elem_int] = {
+                            'a': avg, 'b': 0, 'n_pts': n_pts, 'r2': 0,
+                            'excluded': True, 'property': elem_pid_int
+                        }
+                        excluded_elem_data.append((elem_int, n_pts))
+                        continue
+
+                    try:
+                        x = elem_data['Thickness'].values.astype(float)
+                        y = elem_data['Allowable'].values.astype(float)
+
+                        valid_mask = (x > 0) & (y > 0)
+                        x, y = x[valid_mask], y[valid_mask]
+
+                        if len(x) < 2:
+                            self.allowable_elem_interp[elem_int] = {
+                                'a': np.mean(y), 'b': 0, 'n_pts': len(x), 'r2': 0,
+                                'excluded': True, 'property': elem_pid_int
+                            }
+                            excluded_elem_data.append((elem_int, len(x)))
+                            continue
+
+                        # Power law fit: log_y = b * log_x + log_a
+                        log_x, log_y = np.log(x), np.log(y)
+                        coeffs = np.polyfit(log_x, log_y, 1)
+                        b, log_a = coeffs[0], coeffs[1]
+                        a = np.exp(log_a)
+
+                        # Calculate R²
+                        y_pred = a * (x ** b)
+                        ss_res = np.sum((y - y_pred) ** 2)
+                        ss_tot = np.sum((y - np.mean(y)) ** 2)
+                        r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+                        if r2 < r2_threshold:
+                            self.allowable_elem_interp[elem_int] = {
+                                'a': np.mean(y), 'b': 0, 'n_pts': n_pts, 'r2': r2,
+                                'excluded': True, 'property': elem_pid_int
+                            }
+                            excluded_elem_r2.append((elem_int, r2, n_pts))
+                        else:
+                            self.allowable_elem_interp[elem_int] = {
+                                'a': a, 'b': b, 'n_pts': n_pts, 'r2': r2,
+                                'excluded': False, 'property': elem_pid_int
+                            }
+                            valid_elems.append(elem_int)
+
+                    except Exception as e:
+                        self.allowable_elem_interp[elem_int] = {
+                            'a': 100, 'b': 0, 'n_pts': n_pts, 'r2': 0,
+                            'excluded': True, 'property': elem_pid_int
+                        }
+                        excluded_elem_data.append((elem_int, n_pts))
+
+                # Element fitting report
+                self.rf_log(f"Valid element fits (R² >= {r2_threshold}): {len(valid_elems)}")
+                self.rf_log(f"Excluded elements (R² < {r2_threshold}): {len(excluded_elem_r2)}")
+                self.rf_log(f"Excluded elements (data < {min_data_pts}): {len(excluded_elem_data)}")
+
+                if valid_elems:
+                    self.rf_log(f"\nSample valid fits (Element):")
+                    for elem_id in valid_elems[:5]:
+                        e = self.allowable_elem_interp[elem_id]
+                        self.rf_log(f"  Element {elem_id}: Allow = {e['a']:.4f} × T^({e['b']:.4f}), R²={e['r2']:.4f}")
+
+                total_elem_excluded = len(excluded_elem_r2) + len(excluded_elem_data)
+                self.allowable_status.config(
+                    text=f"✓ Prop: {len(valid_props)} valid | Elem: {len(valid_elems)} valid, {total_elem_excluded} excl",
+                    foreground="green"
+                )
+            else:
+                self.rf_log("\nNo Element_ID column found - skipping element-based fitting")
+                self.allowable_status.config(
+                    text=f"✓ Loaded: {len(valid_props)} valid, {len(excluded_r2)+len(excluded_data)} excluded",
+                    foreground="green"
+                )
+
             self.rf_update_progress(100, "Done")
             
         except Exception as e:
@@ -3655,17 +3768,66 @@ class IntegratedBDFRFTool:
     def get_allowable_stress(self, pid, thickness):
         """Get allowable stress for property at thickness using power law."""
         pid_int = int(pid) if not isinstance(pid, int) else pid
-        
+
         if pid_int not in self.allowable_interp:
             return None
-        
+
         params = self.allowable_interp[pid_int]
-        
+
         if params.get('excluded', False) and params['b'] == 0:
             return params['a']
-        
+
         return params['a'] * (thickness ** params['b'])
-    
+
+    def get_allowable_stress_elem(self, elem_id, thickness):
+        """Get allowable stress for element at thickness using element's own power law fit."""
+        elem_int = int(elem_id) if not isinstance(elem_id, int) else elem_id
+
+        if elem_int not in self.allowable_elem_interp:
+            return None
+
+        params = self.allowable_elem_interp[elem_int]
+
+        if params.get('excluded', False) and params['b'] == 0:
+            return params['a']
+
+        return params['a'] * (thickness ** params['b'])
+
+    def get_required_thickness_elem(self, elem_id, target_stress, min_rf_target=1.0):
+        """
+        Calculate required thickness for element to achieve target RF.
+        Uses element's own curve fit parameters.
+        """
+        elem_int = int(elem_id) if not isinstance(elem_id, int) else elem_id
+
+        if elem_int not in self.allowable_elem_interp:
+            return None
+
+        params = self.allowable_elem_interp[elem_int]
+        a = params['a']
+        b = params['b']
+
+        if params.get('excluded', False) or b == 0:
+            return None
+
+        required_allowable = abs(target_stress) * min_rf_target
+
+        if a <= 0:
+            return None
+
+        try:
+            ratio = required_allowable / a
+            if ratio <= 0:
+                return None
+
+            if b != 0:
+                t_required = ratio ** (1.0 / b)
+                if t_required > 0 and t_required < 1000:
+                    return t_required
+            return None
+        except Exception:
+            return None
+
     def get_required_thickness(self, pid, target_stress, min_rf_target=1.0):
         """
         Calculate required thickness to achieve target RF.
@@ -3824,10 +3986,12 @@ class IntegratedBDFRFTool:
             # PART B: Element-based RF calculation
             # =========================================================
             self.rf_update_progress(50, "Calculating RF (Element-based)...")
-            self.rf_log("\n--- Element-based RF ---")
+            self.rf_log("\n--- Element-based RF (using element's own curve fit) ---")
 
             if hasattr(self, 'max_stress_elem_df') and self.max_stress_elem_df is not None:
                 results_elem = []
+                elem_fit_count = 0
+                prop_fit_count = 0
 
                 for idx, row in self.max_stress_elem_df.iterrows():
                     elem = row.get('Element')
@@ -3841,7 +4005,24 @@ class IntegratedBDFRFTool:
                     elem_int = int(elem) if pd.notna(elem) else None
                     pid_int = int(pid) if pd.notna(pid) else None
 
-                    allowable = self.get_allowable_stress(pid_int, dim1) if pid_int else None
+                    # Try element's own curve fit first, fall back to property
+                    allowable = None
+                    fit_source = "none"
+                    is_excluded = False
+
+                    if elem_int and elem_int in self.allowable_elem_interp:
+                        allowable = self.get_allowable_stress_elem(elem_int, dim1)
+                        if allowable is not None:
+                            fit_source = "element"
+                            elem_fit_count += 1
+                            is_excluded = self.allowable_elem_interp[elem_int].get('excluded', False)
+
+                    if allowable is None and pid_int and pid_int in self.allowable_interp:
+                        allowable = self.get_allowable_stress(pid_int, dim1)
+                        if allowable is not None:
+                            fit_source = "property"
+                            prop_fit_count += 1
+                            is_excluded = self.allowable_interp[pid_int].get('excluded', False)
 
                     if allowable and max_stress > 0:
                         rf = allowable / max_stress
@@ -3857,14 +4038,13 @@ class IntegratedBDFRFTool:
                     else:
                         status = "FAIL"
 
-                    is_excluded = False
-                    if pid_int and pid_int in self.allowable_interp:
-                        is_excluded = self.allowable_interp[pid_int].get('excluded', False)
-
-                    # Calculate Required Thickness
+                    # Calculate Required Thickness using element fit if available
                     required_thickness = None
-                    if pid_int and max_stress > 0:
-                        required_thickness = self.get_required_thickness(pid_int, max_stress, min_rf_target)
+                    if max_stress > 0:
+                        if fit_source == "element" and elem_int:
+                            required_thickness = self.get_required_thickness_elem(elem_int, max_stress, min_rf_target)
+                        elif fit_source == "property" and pid_int:
+                            required_thickness = self.get_required_thickness(pid_int, max_stress, min_rf_target)
 
                     results_elem.append({
                         'Element': elem_int,
@@ -3878,7 +4058,8 @@ class IntegratedBDFRFTool:
                         'Status': status,
                         'Required_Thickness': required_thickness,
                         'Combined_LC': combined_lc,
-                        'Allowable_Excluded': is_excluded
+                        'Allowable_Excluded': is_excluded,
+                        'Fit_Source': fit_source
                     })
 
                 self.rf_results_elem_df = pd.DataFrame(results_elem)
@@ -3895,6 +4076,7 @@ class IntegratedBDFRFTool:
 
                 self.rf_log(f"  Elements: {n_total_elem}, PASS: {n_pass_elem}, FAIL: {n_fail_elem}, NO_ALLOW: {n_no_allow_elem}")
                 self.rf_log(f"  Min RF: {min_rf_elem:.4f}")
+                self.rf_log(f"  Fit source: {elem_fit_count} element fits, {prop_fit_count} property fits")
             else:
                 self.rf_log("  Element-based summary not available (run Merge & Create Summary first)")
                 self.rf_results_elem_df = None
@@ -3995,10 +4177,32 @@ class IntegratedBDFRFTool:
                 self.rf_log(f"  ✓ allowable_fits_props.csv ({len(allow_prop_data)} properties)")
 
             # =========================================================
-            # Allowable Summary - Element based (each element's allowable)
+            # Element Curve Fit Parameters (a, b, R² for each element)
+            # =========================================================
+            elem_curve_fit_data = []
+            if self.allowable_elem_interp:
+                for elem_id, e in self.allowable_elem_interp.items():
+                    elem_curve_fit_data.append({
+                        'Element': elem_id,
+                        'Property': e.get('property'),
+                        'a': e['a'],
+                        'b': e['b'],
+                        'R2': e['r2'],
+                        'n_pts': e['n_pts'],
+                        'Excluded': e.get('excluded', False),
+                        'Formula': f"Allowable = {e['a']:.4f} × T^({e['b']:.4f})" if not e.get('excluded', False) else f"Allowable = {e['a']:.4f} (constant)"
+                    })
+                pd.DataFrame(elem_curve_fit_data).to_csv(os.path.join(out_dir, "element_curve_fits.csv"), index=False)
+                self.rf_log(f"  ✓ element_curve_fits.csv ({len(elem_curve_fit_data)} elements)")
+
+            # =========================================================
+            # Allowable Summary - Element based (using element's own curve fit)
             # =========================================================
             allow_elem_data = []
-            if self.allowable_interp and hasattr(self, 'max_stress_elem_df') and self.max_stress_elem_df is not None:
+            if hasattr(self, 'max_stress_elem_df') and self.max_stress_elem_df is not None:
+                elem_fit_used = 0
+                prop_fit_used = 0
+
                 for _, row in self.max_stress_elem_df.iterrows():
                     elem = row.get('Element')
                     pid = row.get('Property')
@@ -4007,26 +4211,48 @@ class IntegratedBDFRFTool:
                     elem_int = int(elem) if pd.notna(elem) else None
                     pid_int = int(pid) if pd.notna(pid) else None
 
-                    # Calculate allowable for this element using its own Dim1
+                    # Calculate allowable - try element fit first, then property fit
                     allowable = None
                     formula = "N/A"
                     excluded = False
                     a_val = b_val = r2_val = None
+                    fit_source = "none"
 
-                    if pid_int and pid_int in self.allowable_interp:
+                    # First try element's own curve fit
+                    if elem_int and elem_int in self.allowable_elem_interp:
+                        e = self.allowable_elem_interp[elem_int]
+                        a_val = e['a']
+                        b_val = e['b']
+                        r2_val = e['r2']
+                        excluded = e.get('excluded', False)
+                        fit_source = "element"
+                        elem_fit_used += 1
+
+                        if excluded:
+                            allowable = a_val
+                            formula = f"Allowable = {a_val:.4f} (constant, elem fit)"
+                        else:
+                            if dim1 > 0:
+                                allowable = a_val * (dim1 ** b_val)
+                                formula = f"{a_val:.4f} × {dim1:.4f}^({b_val:.4f}) = {allowable:.4f} (elem fit)"
+
+                    # Fall back to property fit if no element fit
+                    elif pid_int and pid_int in self.allowable_interp:
                         p = self.allowable_interp[pid_int]
                         a_val = p['a']
                         b_val = p['b']
                         r2_val = p['r2']
                         excluded = p.get('excluded', False)
+                        fit_source = "property"
+                        prop_fit_used += 1
 
                         if excluded:
                             allowable = a_val
-                            formula = f"Allowable = {a_val:.4f} (constant)"
+                            formula = f"Allowable = {a_val:.4f} (constant, prop fit)"
                         else:
                             if dim1 > 0:
                                 allowable = a_val * (dim1 ** b_val)
-                                formula = f"{a_val:.4f} × {dim1:.4f}^({b_val:.4f}) = {allowable:.4f}"
+                                formula = f"{a_val:.4f} × {dim1:.4f}^({b_val:.4f}) = {allowable:.4f} (prop fit)"
 
                     allow_elem_data.append({
                         'Element': elem_int,
@@ -4037,11 +4263,13 @@ class IntegratedBDFRFTool:
                         'R2': r2_val,
                         'Excluded': excluded,
                         'Allowable': allowable,
-                        'Formula': formula
+                        'Formula': formula,
+                        'Fit_Source': fit_source
                     })
 
                 pd.DataFrame(allow_elem_data).to_csv(os.path.join(out_dir, "allowable_fits_elems.csv"), index=False)
                 self.rf_log(f"  ✓ allowable_fits_elems.csv ({len(allow_elem_data)} elements)")
+                self.rf_log(f"    ({elem_fit_used} element fits, {prop_fit_used} property fits)")
 
             # =========================================================
             # Excel Summary with separate sheets
@@ -4063,12 +4291,14 @@ class IntegratedBDFRFTool:
                     # Allowable Fits sheets
                     if allow_prop_data:
                         pd.DataFrame(allow_prop_data).to_excel(writer, sheet_name='Allowable_Fits_Props', index=False)
+                    if elem_curve_fit_data:
+                        pd.DataFrame(elem_curve_fit_data).to_excel(writer, sheet_name='Elem_Curve_Fits', index=False)
                     if allow_elem_data:
                         pd.DataFrame(allow_elem_data).to_excel(writer, sheet_name='Allowable_Fits_Elems', index=False)
 
                 self.rf_log(f"  ✓ rf_check_summary.xlsx")
                 self.rf_log(f"    Sheets: RF_Results_Prop, RF_Results_Elem, Max_Stress_Prop, Max_Stress_Elem,")
-                self.rf_log(f"            Allowable_Fits_Props, Allowable_Fits_Elems")
+                self.rf_log(f"            Allowable_Fits_Props, Elem_Curve_Fits, Allowable_Fits_Elems")
             except Exception as ex:
                 self.rf_log(f"  Warning: Excel export failed: {ex}")
 
