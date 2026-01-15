@@ -3631,15 +3631,51 @@ class IntegratedBDFRFTool:
 
                 for elem_id in elements:
                     elem_int = int(elem_id)
-                    elem_data = df_elem[df_elem['Element_ID'] == elem_id]
-                    n_pts = len(elem_data)
+                    elem_data = df_elem[df_elem['Element_ID'] == elem_id].copy()
 
                     # Get property for this element
                     elem_pid = elem_data['Property'].iloc[0] if len(elem_data) > 0 else None
                     elem_pid_int = int(elem_pid) if pd.notna(elem_pid) else None
 
+                    # =================================================
+                    # CRITICAL: Filter by Element_Type first
+                    # 1. Sort by Allowable (smallest to largest)
+                    # 2. Find the Element_Type with lowest allowable
+                    # 3. Filter by that Element_Type
+                    # 4. For each Thickness, take minimum Allowable
+                    # =================================================
+                    if 'Element_Type' in elem_data.columns and elem_data['Element_Type'].notna().any():
+                        # Sort by Allowable ascending
+                        elem_data_sorted = elem_data.sort_values('Allowable', ascending=True)
+
+                        # Get the critical Element_Type (the one with lowest allowable)
+                        critical_elem_type = elem_data_sorted.iloc[0]['Element_Type']
+
+                        # Filter by critical Element_Type
+                        filtered_elem_data = elem_data[elem_data['Element_Type'] == critical_elem_type].copy()
+
+                        # For each unique Thickness, get minimum Allowable
+                        fit_data = []
+                        for t in sorted(filtered_elem_data['Thickness'].unique()):
+                            t_data = filtered_elem_data[filtered_elem_data['Thickness'] == t]
+                            min_allow = t_data['Allowable'].min()
+                            fit_data.append({'Thickness': float(t), 'Allowable': float(min_allow)})
+
+                        fit_df = pd.DataFrame(fit_data)
+                    else:
+                        # No Element_Type column - use all data, take min per thickness
+                        fit_data = []
+                        for t in sorted(elem_data['Thickness'].unique()):
+                            t_data = elem_data[elem_data['Thickness'] == t]
+                            min_allow = t_data['Allowable'].min()
+                            fit_data.append({'Thickness': float(t), 'Allowable': float(min_allow)})
+
+                        fit_df = pd.DataFrame(fit_data)
+
+                    n_pts = len(fit_df)
+
                     if n_pts < min_data_pts:
-                        avg = elem_data['Allowable'].mean()
+                        avg = fit_df['Allowable'].mean() if len(fit_df) > 0 else 0
                         self.allowable_elem_interp[elem_int] = {
                             'a': avg, 'b': 0, 'n_pts': n_pts, 'r2': 0,
                             'excluded': True, 'property': elem_pid_int
@@ -3648,8 +3684,8 @@ class IntegratedBDFRFTool:
                         continue
 
                     try:
-                        x = elem_data['Thickness'].values.astype(float)
-                        y = elem_data['Allowable'].values.astype(float)
+                        x = fit_df['Thickness'].values.astype(float)
+                        y = fit_df['Allowable'].values.astype(float)
 
                         valid_mask = (x > 0) & (y > 0)
                         x, y = x[valid_mask], y[valid_mask]
